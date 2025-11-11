@@ -2,14 +2,34 @@ variables:
   stream: testing-devel
   prod: false
 
-releasever: 41
+metadata:
+  # tell `cosa build` to default to buildah path
+  build_with_buildah: true
 
-repos:
-  # These repos are there to make it easier to add new packages to the OS and to
-  # use `cosa fetch --update-lockfile`; but note that all package versions are
-  # still pinned. These repos are also used by the remove-graduated-overrides
-  # GitHub Action.
-  - fedora
-  - fedora-updates
+releasever: 43
+
+conditional-include:
+  # TODO: There is no coreos-pool for RISCV yet
+  #       https://github.com/coreos/fedora-coreos-tracker/issues/1931
+  - if: basearch != "riscv64"
+    include:
+      repos:
+        # These repos are there to make it easier to add new packages to the OS and to
+        # use `cosa fetch --update-lockfile`; but note that all package versions are
+        # still pinned. These repos are also used by the remove-graduated-overrides
+        # GitHub Action.
+        - fedora
+        - fedora-updates
+  - if: basearch == "riscv64"
+    include:
+      repos:
+        # These repos are provided by the RISCV SIG from secondary koji instance
+        # https://fedoraproject.org/wiki/Architectures/RISC-V
+        - fedora-riscv
+        # The staging repo has the unsigned shim in it so we need it here too.
+        - fedora-riscv-staging
+        # The fedora-riscv-koji repo allows us to get the latest built packages.
+        # The other repos aren't updated frequently.
+        - fedora-riscv-koji
 
 include: manifests/fedora-coreos.yaml

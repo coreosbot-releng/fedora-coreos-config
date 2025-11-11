@@ -1,6 +1,7 @@
 #!/bin/bash
 ## kola:
 ##   # We now have composefs turned on in CoreOS.
+##   exclusive: false
 ##   description: Verify that composefs is on.
 
 set -euo pipefail
@@ -8,8 +9,8 @@ set -euo pipefail
 # shellcheck disable=SC1091
 . "$KOLA_EXT_DATA/commonlib.sh"
 
-# RHCOS/SCOS based on 9.4 doesn't use composefs, but legacy sysroot.readonly flag
-if ! is_fcos && [[ "$(get_rhel_ver)" = "9.4" ]]; then
+# RHCOS based on 9.4 doesn't use composefs, but legacy sysroot.readonly flag
+if is_rhcos && [[ "$(get_rhel_ver)" = "9.4" ]]; then
     echo "skipping 9.4"
     exit 0
 fi

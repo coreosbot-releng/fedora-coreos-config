@@ -30,3 +30,15 @@ platform-compressor:
     hyperv: zip
     # On macOS, it's the only compression tool we can rely on.
     applehv: gzip
+    # For DigitalOcean you can upload a qcow2 compressed in either gzip or bzip2
+    # https://docs.digitalocean.com/products/custom-images/how-to/upload/
+    digitalocean: gzip
+
+# Set container-imgref
+container-imgref: "ostree-image-signed:docker://quay.io/fedora/fedora-coreos:{stream}"
+
+# Enable 'erofs' by default for the rootfs in the Live ISO/PXE artifacts
+live-rootfs-fstype: "erofs"
+live-rootfs-fsoptions: "-zlzma,level=6 -Eall-fragments,fragdedupe=inode -C1048576 --quiet"
+
+include: image-default.yaml

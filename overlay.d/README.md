@@ -10,17 +10,6 @@ This overlay matches `fedora-coreos-base.yaml`; core Ignition+ostree bits.
 
 This overlay is shared with RHCOS/SCOS 9.
 
-07fix-selinux-labels
---------------------
-
-Fix incorrect SELinux labels in /boot and /sysroot
-- https://github.com/coreos/fedora-coreos-tracker/issues/1772
-- https://github.com/coreos/fedora-coreos-tracker/issues/1771
-We need this for both FCOS and RHCOS and it needs to live for
-some time (not just a single FCOS barrier release) so that we
-can ensure RHCOS 4.16 aleph nodes and some early 4.17 aleph
-nodes have been fixed. Remove it in the 4.19 cycle.
-
 08nouveau
 ---------
 
@@ -46,12 +35,16 @@ Things that are more closely "Fedora CoreOS":
 * enable FCOS-specific services by default
 * display warnings on the console if no ignition config was provided or no ssh
   key found.
+* display warnings if mount points are not set up properly
 
-16disable-zincati
------------------
+17fcos-container-signing
+------------------------
 
-Disable Zincati on non-production streams:
-https://github.com/coreos/fedora-coreos-tracker/issues/163
+Configuration for container signature verification for our
+fedora-coreos containers pulled from quay.io. Initially adding
+here in a separate overlay to make it easy to include on specific
+streams for the time being. Eventually can probably put this in
+15fcos.
 
 20platform-chrony
 -----------------
@@ -88,8 +81,20 @@ information.
 
 [1] https://github.com/coreos/fedora-coreos-tracker/issues/1517
 
-40grub
-------
+35container-signing-migration
+-----------------------------
 
-Add in static grub configs that will be leveraged by bootupd when
-managing bootloaders. See https://github.com/coreos/bootupd/pull/543
+This overlay will be used to perform a migration such
+that upgrading systems will start using container signatures
+for verification as opposed to OSTree commit signatures.
+
+This is a necessary step for F43 as part of the build-via-container
+change [1]. See [2].
+
+[1] https://github.com/coreos/fedora-coreos-tracker/issues/1969
+[2] https://github.com/coreos/fedora-coreos-tracker/issues/2029
+
+50alternatives
+--------------
+
+Temporary overlay for the alternatives migration scripts.

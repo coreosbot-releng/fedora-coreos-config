@@ -1,0 +1,44 @@
+apiVersion: tekton.dev/v1
+kind: PipelineRun
+metadata:
+  name: fcos-buildroot-on-push
+  namespace: coreos-tenant
+  labels:
+    appstudio.openshift.io/application: fcos-buildroot
+    appstudio.openshift.io/component: fcos-buildroot
+    pipelines.appstudio.openshift.io/type: build
+  annotations:
+    build.appstudio.openshift.io/repo: https://github.com/Roshan-R/fedora-coreos-config?rev={{revision}}
+    pipelinesascode.tekton.dev/cancel-in-progress: "false"
+    build.appstudio.redhat.com/commit_sha: '{{revision}}'
+    build.appstudio.redhat.com/target_branch: '{{target_branch}}'
+    pipelinesascode.tekton.dev/max-keep-runs: "3"
+    pipelinesascode.tekton.dev/on-cel-expression: event == "push" && target_branch
+      == "testing-devel" && (".tekton/fcos-buildroot/fcos-buildroot-push.yaml".pathChanged() ||  "ci/buildroot/**".pathChanged())
+  creationTimestamp: null
+spec:
+  params:
+  - name: git-url
+    value: '{{source_url}}'
+  - name: revision
+    value: '{{revision}}'
+  - name: output-image
+    value: quay.io/konflux-fedora/coreos-tenant/fcos-buildroot:{{revision}}
+  - name: dockerfile
+    value: ./ci/buildroot/Dockerfile
+  - name: path-context
+    value: ci/buildroot
+  - name: labels
+    value:
+      - description="Used by CoreOS CI to build software such as Ignition, rpm-ostree, ostree, coreos-installer, and more."
+  pipelineRef:
+    params:
+    - name: bundle
+      value: quay.io/bootc-devel/tekton-catalog/pipeline-buildah-build-bootc-multi-platform-oci-ta@sha256:49a26e077686af4597fb94ed687fb135ad62058aa014db8950653e83b74189b4
+    - name: name
+      value: buildah-build-bootc-multi-platform-oci-ta
+    - name: kind
+      value: pipeline
+    resolver: bundles
+  taskRunTemplate:
+    serviceAccountName: build-pipeline-fcos-buildroot
