@@ -3,108 +3,84 @@
 # core functionality.
 
 include:
-  - kernel.yaml
   - system-configuration.yaml
   - ignition-and-ostree.yaml
   - file-transfer.yaml
   - networking-tools.yaml
   - user-experience.yaml
-  - shared-workarounds.yaml
-  - shared-el9.yaml
-  - shared-el10.yaml
-
-conditional-include:
-  # starting from f42, we inherit from tier-x
-  # once we're on f42, we can move this up to the default list of includes above
-  - if: releasever >= 42
-    include: tier-x.yaml
-  # all these are inherited from tier-x in f42+, but we carry them here to
-  # enforce that there's really no coupling until f42
-  - if: releasever < 42
-    include: tier-x-dupes.yaml
+  - shared-el.yaml
+  - coreos-bootc-delta.yaml
 
 ostree-layers:
   - overlay/05core
   - overlay/08nouveau
   - overlay/09misc
   - overlay/20platform-chrony
-  - overlay/25azure-udev-rules
   - overlay/30lvmdevices
-  - overlay/40grub
+
+conditional-include:
+  - if: releasever < 44
+    include:
+      postprocess:
+        # Enable SELinux booleans used by OpenShift
+        # https://github.com/coreos/fedora-coreos-tracker/issues/284
+        # This definition is no longer used to actually effect change
+        # in the OpenShift Node images so let's drop it in 44+. The
+        # config for the OpenShift Node image is now in:
+        # https://github.com/openshift/os/blob/c96e35987fb1093beb7631f27aecf324ae8a44f5/packages-openshift.yaml#L98-L103
+        - |
+          #!/usr/bin/bash
+          set -eux -o pipefail
+          setsebool -P -N container_use_cephfs on  # RHBZ#1692369
+          setsebool -P -N virt_use_samba on  # RHBZ#1754825
+          rm -f /etc/selinux/targeted/semanage.*.LOCK
+
 
 # Be minimal
 recommends: false
-
-ignore-removed-users:
-  - root
-ignore-removed-groups:
-  - root
-etc-group-members:
-  - wheel
-  - sudo
-  - systemd-journal
-  - adm
-
-check-passwd:
-  type: "file"
-  filename: "passwd"
-check-groups:
-  type: "file"
-  filename: "group"
-
-default-target: multi-user.target
-
-# we can drop this when it's the rpm-ostree default
-rpmdb: sqlite
+documentation: false
 
 # ⚠⚠⚠ ONLY TEMPORARY HACKS ALLOWED HERE; ALL ENTRIES NEED TRACKER LINKS ⚠⚠⚠
 # See also the version of this in fedora-coreos.yaml
 postprocess:
-  # Enable SELinux booleans used by OpenShift
-  # https://github.com/coreos/fedora-coreos-tracker/issues/284
-  - |
-    #!/usr/bin/env bash
-    set -xeuo pipefail
-    setsebool -P -N container_use_cephfs on  # RHBZ#1692369
-    setsebool -P -N virt_use_samba on  # RHBZ#1754825
-
   # Mask dnsmasq. We include dnsmasq for host services that use the dnsmasq
   # binary but intentionally mask the systemd service so users can't easily
   # use it as an external dns server. We prefer they use a container for that.
   # https://github.com/coreos/fedora-coreos-tracker/issues/519
   - |
-    #!/usr/bin/env bash
+    #!/usr/bin/bash
+    set -eux -o pipefail
     systemctl mask dnsmasq.service
 
-  # Default to iptables-nft. Otherwise, legacy wins. We can drop this once/if we
-  # remove iptables-legacy. This is needed because alternatives don't work
-  # https://github.com/coreos/fedora-coreos-tracker/issues/677
-  # https://github.com/coreos/fedora-coreos-tracker/issues/676
+  # sudo prefers its config files to be mode 440, and some security scanners
+  # complain if /etc/sudoers.d files are world-readable.
+  # https://bugzilla.redhat.com/show_bug.cgi?id=1981979
+  # This is added by the 05core overlay listed above.
   - |
     #!/usr/bin/env bash
     set -xeuo pipefail
-    ln -sf /usr/sbin/ip6tables-nft         /etc/alternatives/ip6tables
-    ln -sf /usr/sbin/ip6tables-nft-restore /etc/alternatives/ip6tables-restore
-    ln -sf /usr/sbin/ip6tables-nft-save    /etc/alternatives/ip6tables-save
-    ln -sf /usr/sbin/iptables-nft          /etc/alternatives/iptables
-    ln -sf /usr/sbin/iptables-nft-restore  /etc/alternatives/iptables-restore
-    ln -sf /usr/sbin/iptables-nft-save     /etc/alternatives/iptables-save
+    chmod 440 /etc/sudoers.d/coreos-sudo-group
 
-  # Force the ssh-host-keys-migration to happen on every boot
-  # to handle cases where someone did a upgrade->rollback->upgrade
-  # See https://github.com/coreos/fedora-coreos-tracker/issues/1473
-  # We should remove this after the next barrier release.
+  # Set the default systemd target to `multi-user.target`.
   - |
     #!/usr/bin/env bash
     set -xeuo pipefail
-    mkdir -p /usr/lib/systemd/system/ssh-host-keys-migration.service.d
-    cat <<'EOF' > /usr/lib/systemd/system/ssh-host-keys-migration.service.d/coreos-force-migration-on-every-boot.conf
-    # Force the ssh-host-keys-migration to happen on every boot
-    # to handle cases where someone did a upgrade->rollback->upgrade
-    # See https://github.com/coreos/fedora-coreos-tracker/issues/1473
-    [Unit]
-    ConditionPathExists=
-    EOF
+    ln -sf multi-user.target /usr/lib/systemd/system/default.target
+
+  # Add the sudo group to /etc/group in container-native flow.
+  - |
+    #!/usr/bin/env bash
+    set -xeuo pipefail
+    if [ -f /run/.containerenv ]; then
+      grep sudo /usr/lib/group >> /etc/group
+    fi
+
+  # Hack to avoid running out of space on aarch64. This should save us about 29M.
+  # https://github.com/coreos/fedora-coreos-tracker/issues/2004
+  - |
+    #!/usr/bin/env bash
+    set -eux -o pipefail
+    rm -vrf /usr/lib/modules/*aarch64/dtb/qcom/
 
 # Packages listed here should be specific to Fedore CoreOS (as in not yet
 # available in RHCOS or not desired in RHCOS). All other packages should go
@@ -131,8 +107,6 @@ packages:
   # provide `container-network-stack`.
   # https://github.com/coreos/fedora-coreos-tracker/issues/1128#issuecomment-1071458717
   - netavark
-  # Minimal NFS client
-  - nfs-utils-coreos
   # Active Directory support
   - adcli
   # Additional firewall support; we aren't including these in RHCOS or they
@@ -142,7 +116,6 @@ packages:
   - wireguard-tools
   # Storage
   - btrfs-progs
-  - WALinuxAgent-udev
   # Allow communication between sudo and SSSD
   # for caching sudo rules by SSSD.
   # https://github.com/coreos/fedora-coreos-tracker/issues/445
@@ -161,14 +134,8 @@ packages:
   - console-login-helper-messages-motdgen
   # i18n
   - kbd
-  # resolved was broken out to its own package in rawhide/f35
-  - systemd-resolved
-  # In F35+ need `iptables-legacy` package
-  # See https://github.com/coreos/fedora-coreos-tracker/issues/676#issuecomment-928028451
-  - iptables-legacy
   # NIC firmware we've traditionally shipped but then were split out of linux-firmware in Fedora
   - qed-firmware # https://github.com/coreos/fedora-coreos-tracker/issues/1746
-
 
 # - irqbalance
 #   - This thing is crying out to be pulled into systemd, but that hasn't happened
@@ -208,9 +175,3 @@ packages-aarch64:
   - crun-wasm wasmedge-rt
 packages-s390x:
   - qemu-user-static-x86
-
-remove-from-packages:
-  # Hopefully short-term hack -- see https://github.com/coreos/fedora-coreos-config/pull/1206#discussion_r705425869.
-  # This keeps the size down and ensures nothing tries to use it, preventing us
-  # from shedding the dep eventually.
-  - [cracklib-dicts, .*]

@@ -1,6 +1,7 @@
 #!/usr/bin/python3
 
 import argparse
+import dotenv
 import functools
 import os
 import sys
@@ -11,8 +12,7 @@ import yaml
 import subprocess
 
 import bodhi.client.bindings
-import dnf
-import hawkey
+import libdnf5
 import koji
 
 KOJI_URL = 'https://koji.fedoraproject.org/kojihub'
@@ -51,34 +51,36 @@ def main():
     parser = argparse.ArgumentParser(description='Manage overrides.')
     # "dest" to work around https://bugs.python.org/issue29298
     subcommands = parser.add_subparsers(title='subcommands', required=True,
-            dest='command')
+                                        dest='command')
 
-    fast_track = subcommands.add_parser('fast-track',
-            description='Fast-track Bodhi updates.')
+    fast_track = subcommands.add_parser(
+        'fast-track', description='Fast-track Bodhi updates.')
     fast_track.add_argument('update', nargs='+',
-            help='ID or URL of Bodhi update to fast-track')
-    fast_track.add_argument('-r', '--reason',
-            help='URL explaining the reason for the fast-track')
+                            help='ID or URL of Bodhi update to fast-track')
+    fast_track.add_argument(
+        '-r',
+        '--reason',
+        help='URL explaining the reason for the fast-track')
     fast_track.add_argument('--ignore-dist-mismatch', action='store_true',
-            help='ignore mismatched Fedora major version')
+                            help='ignore mismatched Fedora major version')
     fast_track.set_defaults(func=do_fast_track)
 
     pin = subcommands.add_parser('pin', description='Pin source RPMs.')
     pin.add_argument('nvr', nargs='+',
-            help='NVR of SRPM to pin')
+                     help='NVR of SRPM to pin')
     pin.add_argument('-r', '--reason', required=True,
-            help='URL explaining the reason for the pin')
+                     help='URL explaining the reason for the pin')
     pin.add_argument('--ignore-dist-mismatch', action='store_true',
-            help='ignore mismatched Fedora major version')
+                     help='ignore mismatched Fedora major version')
     pin.set_defaults(func=do_pin)
 
-    srpms = subcommands.add_parser('srpms',
-            description='Name the relevant source RPMs for a Bodhi update.')
+    srpms = subcommands.add_parser(
+        'srpms', description='Name the relevant source RPMs for a Bodhi update.')
     srpms.add_argument('update', help='ID or URL of Bodhi update')
     srpms.set_defaults(func=do_srpms)
 
-    graduate = subcommands.add_parser('graduate',
-            description='Remove graduated overrides.')
+    graduate = subcommands.add_parser(
+        'graduate', description='Remove graduated overrides.')
     graduate.set_defaults(func=do_graduate)
 
     args = parser.parse_args()
@@ -96,7 +98,8 @@ def do_fast_track(args):
         for source_nvr in source_nvrs:
             source_name = '-'.join(source_nvr.split('-')[:-2])
             if not args.reason and source_name not in TRIVIAL_FAST_TRACKS:
-                raise Exception(f'No reason URL specified and source package {source_name} not in {TRIVIAL_FAST_TRACKS}')
+                raise Exception(f'No reason URL specified and source package {
+                                source_name} not in {TRIVIAL_FAST_TRACKS}')
         for n, info in get_binary_packages(source_nvrs).items():
             if not args.ignore_dist_mismatch:
                 check_dist_tag(n, info, dist)
@@ -108,7 +111,8 @@ def do_fast_track(args):
                 info['metadata']['reason'] = args.reason
             overrides[n] = info
     if not overrides:
-        raise Exception('specified updates contain no binary packages listed in lockfiles')
+        raise Exception(
+            'specified updates contain no binary packages listed in lockfiles')
     for lockfile_path in get_lockfiles():
         merge_overrides(lockfile_path, overrides)
 
@@ -126,7 +130,8 @@ def do_pin(args):
         )
         overrides[n] = info
     if not overrides:
-        raise Exception('specified source packages produce no binary packages listed in lockfiles')
+        raise Exception(
+            'specified source packages produce no binary packages listed in lockfiles')
     for lockfile_path in get_lockfiles():
         merge_overrides(lockfile_path, overrides)
 
@@ -138,7 +143,8 @@ def do_srpms(args):
             print(nvr)
             printed = True
     if not printed:
-        raise Exception('specified update contains no binary packages listed in lockfiles')
+        raise Exception(
+            'specified update contains no binary packages listed in lockfiles')
 
 
 def do_graduate(_args):
@@ -149,28 +155,44 @@ def do_graduate(_args):
     for fn in get_lockfiles():
         graduate_lockfile(base, fn)
 
+@functools.cache
+def get_build_args():
+    return dotenv.dotenv_values(os.path.join(basedir, 'build-args.conf'))
 
 def get_treefile():
-    treefile = subprocess.check_output(['rpm-ostree', 'compose', 'tree',
-                                        '--print-only',
-                                        os.path.join(basedir, 'manifest.yaml')])
+    build_args = get_build_args()
+    treefile = subprocess.check_output(
+        [os.path.join(basedir, 'build-rootfs'),
+        f'--srcdir={basedir}', 'parse-treefile'],
+        env=build_args
+    )
     return json.loads(treefile)
 
 
 def get_dnf_base(treefile):
-    base = dnf.Base()
-    base.conf.reposdir = basedir
-    base.conf.releasever = treefile['releasever']
-    base.read_all_repos()
+    base = libdnf5.base.Base()
+    # Prevent loading libdnf5 plugins
+    base.get_config().plugins = False
+
+    # Override required options
+    base.get_config().reposdir = (basedir)
+    base.get_vars().set("releasever", str(treefile['releasever']))
+    base.get_vars().set("basearch", treefile['basearch'])
+
+    # Load configuration from the config files and finish initialization
+    base.load_config()
+    base.setup()
+
+    # Create repositories from system configuration files.
+    base.get_repo_sack().create_repos_from_reposdir()
     return base
 
 
 @functools.cache
 def get_stream():
     '''Get the current stream name.'''
-    with open(os.path.join(basedir, 'manifest.yaml')) as fh:
-        manifest = yaml.safe_load(fh)
-    return manifest['variables']['stream']
+    build_args = get_build_args()
+    return build_args['STREAM']
 
 
 @functools.cache
@@ -189,7 +211,8 @@ def get_manifest_packages(arch):
 
     # If this branch has any lockfiles in it, return the lockfile for the
     # specified arch, or an empty dict if missing.
-    lockfile_path = lambda arch: os.path.join(basedir, f'manifest-lock.{arch}.json')
+    def lockfile_path(arch): return os.path.join(
+        basedir, f'manifest-lock.{arch}.json')
     if any(os.path.exists(lockfile_path(a)) for a in ARCHES):
         try:
             with open(lockfile_path(arch)) as f:
@@ -206,8 +229,8 @@ def get_manifest_packages(arch):
     if not versions:
         return {}
     eprint(f'Reading generated lockfile from build {versions[0]} on {arch}')
-    lockfile_url = GENERATED_LOCKFILE_URL_TEMPLATE.format(stream=get_stream(),
-            version=versions[0], arch=arch)
+    lockfile_url = GENERATED_LOCKFILE_URL_TEMPLATE.format(
+        stream=get_stream(), version=versions[0], arch=arch)
     resp = requests.get(lockfile_url)
     resp.raise_for_status()
     return resp.json()['packages']
@@ -238,7 +261,7 @@ def get_binary_packages(source_nvrs):
     accepted_in_arch = {}
     client = koji.ClientSession(KOJI_URL)
 
-    archful = lambda arch: arch != 'noarch'
+    def archful(arch): return arch != 'noarch'
 
     def arches_with_package(name, arch):
         '''For a given package and arch, return the arches that list the
@@ -261,19 +284,24 @@ def get_binary_packages(source_nvrs):
                 accepted_in_arch.setdefault(arch, set()).add(name)
 
     # Check that every arch has the same package set
-    if list(accepted_in_arch.values())[:-1] != list(accepted_in_arch.values())[1:]:
-        raise Exception(f'This tool cannot handle arch-specific overrides: {accepted_in_arch}')
+    if list(accepted_in_arch.values())[
+            :-1] != list(accepted_in_arch.values())[1:]:
+        raise Exception(
+            f'This tool cannot handle arch-specific overrides: {accepted_in_arch}')
 
     return binpkgs
 
 
 def setup_repos(base, treefile):
-    for repo in base.repos.values():
+    query = libdnf5.repo.RepoQuery(base)
+    for repo in query:
         repo.disable()
 
     eprint("Enabled repos:")
-    for repo in treefile['repos']:
-        base.repos[repo].enable()
+    for repo in treefile.get('repos', []):
+        query = libdnf5.repo.RepoQuery(base)
+        query.filter_id(repo)
+        query.get().enable()
         eprint(f"- {repo}")
 
 
@@ -295,9 +323,9 @@ def graduate_lockfile(base, fn):
     if len(lockfile.get('packages', {})) == 0:
         return
 
-    if base.sack is None:
-        eprint("Downloading metadata")
-        base.fill_sack(load_system_repo=False)
+    eprint("Downloading metadata")
+    base.get_repo_sack().load_repos(libdnf5.repo.Repo.Type_AVAILABLE)
+    basearch = base.get_vars().get_value("basearch")
 
     new_packages = {}
     for name, lock in lockfile['packages'].items():
@@ -311,7 +339,7 @@ def graduate_lockfile(base, fn):
         else:
             # it applies to all arches, so we can just check our arch (see
             # related TODO above)
-            nevra = f"{name}-{lock['evr']}.{base.conf.basearch}"
+            nevra = f"{name}-{lock['evr']}.{basearch}"
         graduated = sack_has_nevra_greater_or_equal(base, nevra)
         if not graduated:
             new_packages[name] = lock
@@ -326,19 +354,26 @@ def graduate_lockfile(base, fn):
 
 
 def sack_has_nevra_greater_or_equal(base, nevra):
-    nevra = hawkey.split_nevra(nevra)
-    pkgs = base.sack.query().filterm(name=nevra.name,
-                                     arch=nevra.arch).latest().run()
+    form_nevra = libdnf5.rpm.VectorNevraForm(1, libdnf5.rpm.Nevra.Form_NEVRA)
+    nevra = libdnf5.rpm.Nevra.parse(nevra, form_nevra)[0]
+
+    query = libdnf5.rpm.PackageQuery(base)
+    query.filter_arch(nevra.get_arch())
+    query.filter_name(nevra.get_name())
+    query.filter_latest_evr()
+    pkgs = [pkg.get_full_nevra() for pkg in query]
 
     if len(pkgs) == 0:
         # Odd... the only way I can imagine this happen is if we fast-track a
         # brand new package from Koji which hasn't hit the updates repo yet.
         # Corner-case, but let's be nice.
-        eprint(f"couldn't find package {nevra.name}; assuming not graduated")
+        eprint(
+            f"couldn't find package {
+                nevra.get_name()}; assuming not graduated")
         return False
 
-    nevra_latest = hawkey.split_nevra(str(pkgs[0]))
-    return nevra_latest >= nevra
+    nevra_latest = libdnf5.rpm.Nevra.parse(pkgs[0], form_nevra)[0]
+    return not libdnf5.rpm.cmp_nevra(nevra_latest, nevra) #  nevra_latest >= nevra
 
 
 def merge_overrides(fn, overrides):
@@ -363,16 +398,18 @@ def check_url(u):
 
 
 def get_expected_dist_tag():
-    with open(os.path.join(basedir, 'manifest.yaml')) as f:
-        releasever = yaml.safe_load(f)['releasever']
+    build_args = get_build_args()
+    releasever = build_args['VERSION']
     return f'.fc{releasever}'
 
 
 def check_dist_tag(name, info, dist):
     if 'evr' in info and not info['evr'].endswith(dist):
-        raise Exception(f"Package {name}-{info['evr']} doesn't match expected dist tag {dist}")
+        raise Exception(
+            f"Package {name}-{info['evr']} doesn't match expected dist tag {dist}")
     if 'evra' in info and not info['evra'].endswith(dist + '.noarch'):
-        raise Exception(f"Package {name}-{info['evra']} doesn't match expected dist tag {dist}")
+        raise Exception(
+            f"Package {name}-{info['evra']} doesn't match expected dist tag {dist}")
 
 
 def eprint(*args, **kwargs):

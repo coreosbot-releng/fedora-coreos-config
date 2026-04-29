@@ -2,60 +2,68 @@
 # into "official" builds of Fedora CoreOS (such as including `fedora-release-coreos`)
 # or are very "opinionated" like disabling SSH passwords by default.
 
-ref: fedora/${basearch}/coreos/${stream}
-metadata:
-  license: MIT
-  name: fedora-coreos
-  summary: Fedora CoreOS ${stream}
-
-add-commit-metadata:
-  fedora-coreos.stream: ${stream}
-
-
 include: fedora-coreos-base.yaml
 conditional-include:
-  - if: prod == false
-    # long-term, would be good to support specifying a nested TreeComposeConfig
-    include: disable-zincati.yaml
+  # If not on a production stream then disable Zincati
   - if:
-    - basearch != "s390x"
-    # for 42+, it's inherited from fedora-bootc
-    - releasever < 42
-    # And remove some cruft from grub2
-    include: grub2-removals.yaml
-  # On <41, we want to keep making sure dnf doesn't slip in somehow
-  # On 41+, we do want it
-  # https://github.com/coreos/fedora-coreos-tracker/issues/1687
-  - if: releasever < 41
-    include: exclude-dnf.yaml
-  # for 42+, it's inherited from fedora-bootc
-  - if: releasever == 41
-    include: include-dnf.yaml
-  # Wifi firmwares will be dropped in F41
-  - if: releasever < 41
-    include: wifi-firmwares.yaml
-  # for 42+, it's inherited from fedora-bootc
-  - if: releasever == 41
-    include: composefs.yaml
-  - if: releasever >= 41
-    include: selinux-workaround.yaml
+      - stream != "stable"
+      - stream != "testing"
+      - stream != "next"
+    include:
+      postprocess:
+        - |
+          #!/usr/bin/bash
+          set -eux -o pipefail
+          cat > /etc/zincati/config.d/90-disable-on-non-production-stream.toml << EOF
+          # https://github.com/coreos/fedora-coreos-tracker/issues/163
+          updates.enabled = false
+          EOF
+  # TODO: There is no coreos-pool tag/repo for RISCV yet
+  #       https://github.com/coreos/fedora-coreos-tracker/issues/1931
+  - if: basearch != "riscv64"
+    include:
+      # All Fedora CoreOS streams share the same pool for locked files.
+      lockfile-repos:
+        - fedora-coreos-pool
+  - if: basearch == "aarch64"
+    include:
+      ostree-layers:
+        - overlay/10aarch64
+  # In F43 and older pull in the nfs-utils-coreos package
+  - if: releasever <= 43
+    include:
+      packages:
+        - nfs-utils-coreos
+  # In F44 we can use the nfs-client-utils package, which obsoletes nfs-utils-coreos
+  - if: releasever >= 44
+    include:
+      packages:
+        - nfs-client-utils
+  # Do the alternatives migration from 43
+  - if: releasever >= 43
+    include:
+      ostree-layers:
+        - overlay/50alternatives
+  # Drop fedora-repos-ostree in F44
+  - if: releasever < 44
+    include:
+      packages:
+        - fedora-repos-ostree
+  # We carry our own ssh config for authorized keys in <44. In 44+
+  # The config is delivered via the ignition + afterburn RPMs
+  # https://src.fedoraproject.org/rpms/ignition/c/3ccce9fe2c0462f4a17923937933ab9c26db0aa5?branch=rawhide
+  # https://src.fedoraproject.org/rpms/rust-afterburn/c/e61c6e5f776410ea72e8f731cec88567577f6bb8?branch=rawhide
+  - if: releasever <= 43
+    include:
+      ostree-layers:
+        - overlay/18sshd-authorized-keys-file
 
 ostree-layers:
   - overlay/15fcos
-
-automatic-version-prefix: "${releasever}.<date:%Y%m%d>.dev"
-mutate-os-release: "${releasever}"
-
-# All Fedora CoreOS streams share the same pool for locked files.
-lockfile-repos:
-  - fedora-coreos-pool
+  - overlay/17fcos-container-signing
 
 packages:
   - fedora-release-coreos
-  - fedora-repos-ostree
-  # the archive repo for more reliable package layering
-  # https://github.com/coreos/fedora-coreos-tracker/issues/400
-  - fedora-repos-archive
   # CL ships this.
   - moby-engine
   # Already pulled in by moby-engine, but let's be explicit. Typhoon uses it.
@@ -67,13 +75,6 @@ packages:
   # Introduce a default colored prompt for Fedora's default shell bash.
   # https://github.com/coreos/fedora-coreos-tracker/issues/1567
   - bash-color-prompt
-
-etc-group-members:
-  # Add the docker group to /etc/group
-  # https://github.com/coreos/fedora-coreos-tracker/issues/2
-  # This will be no longer needed when systemd-sysusers has been implemented:
-  # https://github.com/projectatomic/rpm-ostree/issues/49
-  - docker
 
 # ⚠⚠⚠ ONLY TEMPORARY HACKS ALLOWED HERE; ALL ENTRIES NEED TRACKER LINKS ⚠⚠⚠
 # See also the version of this in fedora-coreos-base.yaml
@@ -101,81 +102,69 @@ postprocess:
     # information.
 
     EOF
-    cat /usr/etc/rpm-ostreed.conf >> /tmp/rpm-ostreed.conf
-    cp /tmp/rpm-ostreed.conf /usr/etc/rpm-ostreed.conf
+    conf_file=/usr/etc/rpm-ostreed.conf
+    # if we're deriving, then the config is in /etc already
+    if [ -f /run/.containerenv ]; then
+      conf_file=/etc/rpm-ostreed.conf
+    fi
+    cat "${conf_file}" >> /tmp/rpm-ostreed.conf
+    cp /tmp/rpm-ostreed.conf "${conf_file}"
     rm /tmp/rpm-ostreed.conf
-  # Make sure that we do not ship broken symlinks:
-  # https://github.com/coreos/fedora-coreos-config/issues/1782
-  # Remove known broken symlinks that point to non-existing files or directories:
-  # - Remove `.build-id` for binaries that we remove in other parts of the FCOS manifest
-  # - Remove links to man pages that we remove in FCOS
-  # Man pages are removed in FCOS thus the links in alternatives pointing to those are left there broken.
-  # Docs removal comes from manifests/fedora-coreos.yaml
-  # - systemd-firstboot comes from manifests/ignition-and-ostree.yaml
-  # - systemd-gpt-auto-generator comes from ignition-and-ostree.yaml
+
+  # Add the docker group to /etc/group
+  # https://github.com/coreos/fedora-coreos-tracker/issues/2
+  # This will be no longer needed when systemd-sysusers has been implemented:
+  # https://github.com/projectatomic/rpm-ostree/issues/49
   - |
     #!/usr/bin/env bash
-    set -euo pipefail
+    set -xeuo pipefail
+    if [ -f /run/.containerenv ]; then
+      grep ^docker: /usr/lib/group >> /etc/group
+    fi
 
-    list_broken_symlinks_folders=(
-      '/etc/alternatives/'
-      '/usr/lib/.build-id/'
+  # Implement exclude-packages: in a postprocess because when building
+  # via container we don't have exclude-packages functionality.
+  #
+  # These are things we don't expect to ship on the host. We currently
+  # have recommends: false so these could only come in via hard requirement,
+  # in which case the build will fail.
+  - |
+    #!/usr/bin/env bash
+    set -x
+    excludes=(
+      perl
+      perl-interpreter
+      python
+      python3
+      python3-libs
+      nodejs
+      grubby
+      cowsay  # Just in case
+    # Let's make sure initscripts doesn't get pulled back in
+    # https://github.com/coreos/fedora-coreos-tracker/issues/220#issuecomment-611566254
+      initscripts
+    # nor /usr/sbin/service
+      initscripts-service
+    # For (datacenter/cloud oriented) servers, we want to see the details by default.
+    # https://lists.fedoraproject.org/archives/list/devel@lists.fedoraproject.org/thread/HSMISZ3ETWQ4ETVLWZQJ55ARZT27AAV3/
+      plymouth
+    # Do not use legacy ifcfg config format in NetworkManager
+    # See https://github.com/coreos/fedora-coreos-config/pull/1991
+      NetworkManager-initscripts-ifcfg-rh
     )
+    # Determine if anything that isn't allowed is actually provided.
+    actuals="$(rpm -q --whatprovides ${excludes[@]} | grep -v 'no package provides')"
+    if [ ! -z "${actuals}" ]; then
+        echo "Something is providing excluded RPM functionality!" 1>&2
+        echo "${actuals}" 1>&2
+        exit 1
+    fi
 
-    # It is not possible to remove files from usr after first boot so that is
-    # why we are removing them in the postprocess scripts here.
-    # The .build-id links are pointing to binaries that we remove in other parts of the FCOS manifest.
-    list_known_removed_folders=(
-      '/usr/bin/systemd-firstboot'
-      '/usr/lib/systemd/system-generators/systemd-gpt-auto-generator'
-      '/usr/share/doc/'
-      '/usr/share/info/'
-      '/usr/share/man/'
-      )
-    for folder in "${list_broken_symlinks_folders[@]}"; do
-        find "${folder}" -type l | while read -r file_name; do
-            real_path=$(realpath -m "${file_name}");
-            if [[ -e "${real_path}" ]]; then
-              continue
-            fi
-            for element in "${list_known_removed_folders[@]}"; do
-              if [[ "${real_path}" == "${element}"* ]]; then
-                  rm -r "${file_name}"
-              fi
-            done
-        done
-    done
-
-
-remove-files:
-  # We don't ship man(1) or info(1)
-  - usr/share/info
-  - usr/share/man
-  # Drop text docs too
-  - usr/share/doc
-
-# Things we don't expect to ship on the host.  We currently
-# have recommends: false so these could only come in via
-# hard requirement, in which case the build will fail.
-exclude-packages:
-  - python
-  - python2
-  - python2-libs
-  - python3
-  - python3-libs
-  - perl
-  - perl-interpreter
-  - nodejs
-  - grubby
-  - cowsay  # Just in case
-  # Let's make sure initscripts doesn't get pulled back in
-  # https://github.com/coreos/fedora-coreos-tracker/issues/220#issuecomment-611566254
-  - initscripts
-  # nor /usr/sbin/service
-  - initscripts-service
-  # For (datacenter/cloud oriented) servers, we want to see the details by default.
-  # https://lists.fedoraproject.org/archives/list/devel@lists.fedoraproject.org/thread/HSMISZ3ETWQ4ETVLWZQJ55ARZT27AAV3/
-  - plymouth
-  # Do not use legacy ifcfg config format in NetworkManager
-  # See https://github.com/coreos/fedora-coreos-config/pull/1991
-  - NetworkManager-initscripts-ifcfg-rh
+  # We don't want auto-generated mount units. See also
+  # https://github.com/systemd/systemd/issues/13099
+  - |
+    #!/usr/bin/env bash
+    set -x
+    # Find the .build-id file and remove it too so we don't have a broken symlink.
+    build_id_file=$(find -L /usr/lib/.build-id/ -samefile /usr/lib/systemd/system-generators/systemd-gpt-auto-generator)
+    rm -vf $build_id_file /usr/lib/systemd/system-generators/systemd-gpt-auto-generator
