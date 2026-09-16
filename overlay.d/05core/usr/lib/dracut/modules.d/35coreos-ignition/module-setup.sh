@@ -2,6 +2,12 @@
 # -*- mode: shell-script; indent-tabs-mode: nil; sh-basic-offset: 4; -*-
 # ex: ts=8 sw=4 sts=4 et filetype=sh
 
+check() {
+    if [[ $IN_KDUMP == 1 ]]; then
+        return 1
+    fi
+}
+
 depends() {
     echo systemd network ignition coreos-live
 }
@@ -23,8 +29,17 @@ install() {
         lsblk \
         sed \
         grep \
-        sgdisk \
         uname
+
+
+    # In some cases we had to vendor gdisk in Ignition.
+    # If this is the case here use that one.
+    # See https://issues.redhat.com/browse/RHEL-56080
+    if [ -f /usr/libexec/ignition-sgdisk ]; then
+        inst /usr/libexec/ignition-sgdisk /usr/sbin/sgdisk
+    else
+        inst sgdisk
+    fi
 
     # For IBM SecureExecution
     if [[ $(uname -m) = s390x ]]; then
@@ -44,8 +59,8 @@ install() {
     inst_simple "$moddir/80-coreos-boot-disk.rules" \
         "/usr/lib/coreos/80-coreos-boot-disk.rules"
 
-    inst_script "$moddir/coreos-disk-contains-fs.sh" \
-        "/usr/lib/udev/coreos-disk-contains-fs"
+    inst_script "$moddir/coreos-disk-contains-partition-name.sh" \
+        "/usr/lib/udev/coreos-disk-contains-partition-name"
 
     inst_script "$moddir/coreos-ignition-setup-user.sh" \
         "/usr/sbin/coreos-ignition-setup-user"

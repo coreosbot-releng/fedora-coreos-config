@@ -2,6 +2,12 @@
 # -*- mode: shell-script; indent-tabs-mode: nil; sh-basic-offset: 4; -*-
 # ex: ts=8 sw=4 sts=4 et filetype=sh
 
+check() {
+    if [[ $IN_KDUMP == 1 ]]; then
+        return 1
+    fi
+}
+
 depends() {
     echo ignition rdcore
 }
@@ -71,8 +77,16 @@ install() {
         rm        \
         sed       \
         sfdisk    \
-        sgdisk    \
         find
+
+    # In some cases we had to vendor gdisk in Ignition.
+    # If this is the case here use that one.
+    # See https://issues.redhat.com/browse/RHEL-56080
+    if [ -f /usr/libexec/ignition-sgdisk ]; then
+        inst /usr/libexec/ignition-sgdisk /usr/sbin/sgdisk
+    else
+        inst sgdisk
+    fi
 
     for x in mount populate; do
         install_ignition_unit ignition-ostree-${x}-var.service
