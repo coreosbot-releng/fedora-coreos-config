@@ -5,8 +5,9 @@ properties([
     disableConcurrentBuilds(abortPrevious: true)
 ])
 
-// We run `kolaTestIso` which requires at least 8Gi. Add 1Gi for overhead.
-cosaPod(cpus: 4, memory: "9Gi") {
+// We run kola tests including iso.* tests which are resource
+// intensive. Let's give the system a lot of memory.
+cosaPod(cpus: 4, memory: "12Gi") {
     checkoutToDir(scm, 'config')
 
     def basearch = shwrapCapture("cosa basearch")
@@ -24,13 +25,11 @@ cosaPod(cpus: 4, memory: "9Gi") {
 
     // use a --parent-build arg so we can diff later and it matches prod
     def parent_arg = ""
-    def parent_commit = ""
     if (shwrapRc("test -e /srv/coreos/builds/latest/${basearch}/meta.json") == 0) {
         shwrap("cp /srv/coreos/builds/latest/${basearch}/meta.json .") // readJSON wants it in the WORKSPACE
         def meta = readJSON file: "meta.json"
         def version = meta["buildid"]
         parent_arg = "--parent-build ${version}"
-        parent_commit = meta["ostree-commit"]
     }
 
     // do a build. If we are operating on a mechanical stream then we
@@ -40,15 +39,18 @@ cosaPod(cpus: 4, memory: "9Gi") {
     if (env.CHANGE_TARGET in mechanical_streams) {
         no_strict_build = true
     }
-    cosaBuild(skipInit: true, noStrict: no_strict_build, extraFetchArgs: '--with-cosa-overrides', extraArgs: parent_arg)
 
-    stage("Metal/Metal4k") {
-        shwrap("cd /srv/coreos && cosa osbuild metal metal4k")
+    // Don't run tests until all artifacts are built, as iso.* tests are now folded into kola.
+    stage("Build") {
+        cosaBuild(skipInit: true, skipKola: true, noStrict: no_strict_build, extraFetchArgs: '--with-cosa-overrides', extraArgs: parent_arg)
     }
 
-    stage("Test ISO") {
-        shwrap("cd /srv/coreos && cosa buildextend-live")
-        kolaTestIso()
+    stage("Build Artifacts") {
+        shwrap("cd /srv/coreos && cosa osbuild metal metal4k live")
+    }
+
+    stage("Kola Tests") {
+        kola()
     }
 
     // also print the pkgdiff as a separate stage to make it more visible
@@ -56,8 +58,7 @@ cosaPod(cpus: 4, memory: "9Gi") {
         stage("RPM Diff") {
             shwrap("""
                 cd /srv/coreos
-                new_commit=\$(jq -r '.["ostree-commit"]' builds/latest/${basearch}/meta.json)
-                rpm-ostree db diff --repo tmp/repo ${parent_commit} \${new_commit} | tee tmp/diff.txt
+                cosa diff --rpms | tee tmp/diff.txt
                 if grep -q Downgraded tmp/diff.txt; then
                     echo "Downgrade detected. This is likely unintentional. If not, you may safely ignore this error."
                     exit 1

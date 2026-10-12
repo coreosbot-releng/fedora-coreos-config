@@ -8,4 +8,29 @@
 # in the `metadata.reason` key, though it's acceptable to omit a `reason`
 # for FCOS-specific packages (ignition, afterburn, etc.).
 
-packages: {}
+packages:
+  container-selinux:
+    evra: 4:2.250.0-1.fc44.noarch
+    metadata:
+      reason: https://github.com/coreos/fedora-coreos-tracker/issues/2217
+      type: pin
+  coreos-installer:
+    evr: 0.27.0-1.fc44
+    metadata:
+      bodhi: https://bodhi.fedoraproject.org/updates/FEDORA-2026-dcd141daac
+      type: fast-track
+  coreos-installer-bootinfra:
+    evr: 0.27.0-1.fc44
+    metadata:
+      bodhi: https://bodhi.fedoraproject.org/updates/FEDORA-2026-dcd141daac
+      type: fast-track
+  selinux-policy:
+    evra: 44.6-1.fc44.noarch
+    metadata:
+      reason: https://github.com/coreos/fedora-coreos-tracker/issues/2217
+      type: pin
+  selinux-policy-targeted:
+    evra: 44.6-1.fc44.noarch
+    metadata:
+      reason: https://github.com/coreos/fedora-coreos-tracker/issues/2217
+      type: pin

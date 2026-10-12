@@ -7,6 +7,7 @@
 
 packages:
   - ignition
+  - ignition-grub
   - dracut-network
   # for encryption
   - clevis clevis-luks clevis-dracut clevis-systemd
@@ -16,12 +17,16 @@ packages-s390x:
   - veritysetup
 
 postprocess:
-  # Undo RPM scripts enabling units; we want the presets to be canonical
-  # https://github.com/projectatomic/rpm-ostree/issues/1803
+  # We have our own generator for /boot and we don't mount /boot/efi by default
+  # thus we don't strictly need systemd-gpt-auto-generator on Fedora CoreOS.
+  # With https://github.com/systemd/systemd/issues/13099 fixed, we can consider
+  # including it again after more testing. Current known issues are:
+  # - systemd-gpt-auto-generator conflicts with Ignition LUKS provisioning on
+  #   EFI systems.
+  #   See: https://github.com/coreos/fedora-coreos-tracker/issues/2137
   - |
     #!/usr/bin/env bash
-    set -xeuo pipefail
-    rm -rf /etc/systemd/system/*
-    systemctl preset-all
-    rm -rf /etc/systemd/user/*
-    systemctl --user --global preset-all
+    set -x
+    # Find the .build-id file and remove it too so we don't have a broken symlink.
+    build_id_file=$(find -L /usr/lib/.build-id/ -samefile /usr/lib/systemd/system-generators/systemd-gpt-auto-generator)
+    rm -vf $build_id_file /usr/lib/systemd/system-generators/systemd-gpt-auto-generator

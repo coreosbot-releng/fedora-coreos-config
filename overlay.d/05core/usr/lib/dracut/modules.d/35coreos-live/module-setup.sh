@@ -1,3 +1,9 @@
+check() {
+    if [[ $IN_KDUMP == 1 ]]; then
+        return 1
+    fi
+}
+
 depends() {
     # We need the rdcore binary
     echo rdcore
@@ -48,8 +54,8 @@ install() {
         "ignition-complete.target"
 
     install_and_enable_unit "coreos-liveiso-persist-osmet.service" \
-        "default.target"
+        "initrd.target"
 
     install_and_enable_unit "coreos-livepxe-persist-osmet.service" \
-        "default.target"
+        "initrd.target"
 }

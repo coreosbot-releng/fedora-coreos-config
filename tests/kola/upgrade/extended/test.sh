@@ -3,7 +3,9 @@
 ##   # - needs-internet: to pull updates
 ##   tags: "needs-internet"
 ##   # Extend the timeout since a lot of updates/reboots can happen.
-##   timeoutMin: 45
+##   timeoutMin: 50
+##   # Bigger disk since we copy in the OSTree tarball
+##   minDisk: 30
 ##   # Only run this test when specifically requested.
 ##   requiredTag: extended-upgrade
 ##   description: Verify upgrade works.
@@ -12,20 +14,63 @@ set -eux -o pipefail
 
 # shellcheck disable=SC1091
 . "$KOLA_EXT_DATA/commonlib.sh"
+. /etc/os-release # for $VERSION_ID
 
-# This test will attempt to test an upgrade from a given starting
-# point (assumed by the caller passing in a specific
-# `cosa kola run --build=x.y.z`) all the way to the latest build
-# that is staged to be released. The test is basic in that it
-# essentially tests 1) updates work 2) boot works.
+# This test starts from a caller-selected build (`cosa kola run
+# --build=x.y.z`) and verifies that it can update and boot. Only production
+# streams have update graphs, so the test harness that is running this test
+# (i.e. the one calling `cosa kola run`) will need to determine what stream
+# makes the most sense to use as a starting point for the test.
 #
+# For example, the kola-upgrade test in the Fedora CoreOS pipeline uses this
+# mapping to map each requested FCOS stream to a production stream for the
+# graph-based update:
+#
+#   stable        -> stable
+#   testing       -> testing
+#   next          -> next
+#   testing-devel -> testing
+#   next-devel    -> next
+#   branched      -> next
+#   rawhide       -> next
+#
+# Zincati follows that production stream's graph to its latest release. The
+# test then upgrades to the latest build in the requested target stream and
+# verifies that it boots. For example, a next-devel test first updates from
+# next, then upgrades to the next-devel candidate build (the current build
+# under test).
+#
+# `/etc/target_stream` selects a target stream different from the booted
+# build's stream (this is only necessary if you are targeting a different
+# stream than the starting build).
 # An example invocation for this test would look like:
+#
+# ```
+# cat > target_stream.bu <<'EOF'
+# variant: fcos
+# version: 1.0.0
+# storage:
+#   files:
+#     - path: /etc/target_stream
+#       mode: 0644
+#       contents:
+#         inline: |
+#           next-devel
+# EOF
+#
+# cosa buildfetch --artifact=qemu --stream=next --decompress --build=45.20260913.1.1
+# cosa kola run --build=45.20260913.1.1 --debug --tag extended-upgrade \
+#     --append-butane target_stream.bu
+# ```
 
-# ```
-# cosa buildfetch --stream=next --build=34.20210904.1.0 --artifact=qemu
-# cosa decompress --build=34.20210904.1.0
-# cosa kola run --build=34.20210904.1.0 --tag extended-upgrade
-# ```
+# The target image must also be published for the test architecture. Otherwise
+# the final `skopeo inspect` fails and so does the test. For example, if
+# next-devel has no arm64 image, `skopeo` reports:
+# `no image found in image index for architecture "arm64", variant "v8", OS "linux"`
+#
+# More info:
+# - https://github.com/coreos/fedora-coreos-pipeline/blob/main/jobs/kola-upgrade.Jenkinsfile
+# - https://github.com/coreos/fedora-coreos-pipeline/blob/main/utils.groovy#L672
 #
 # You can monitor the progress from the console and journal:
 #   - everything:
@@ -51,53 +96,6 @@ set -eux -o pipefail
 #   - aarch64 34.20210904.1.0
 #   - s390x   36.20220618.1.1
 
-. /etc/os-release # for $VERSION_ID
-
-need_restart='false'
-
-# delete the disabling of updates that was done by the test framework
-if [ -f /etc/zincati/config.d/90-disable-auto-updates.toml ]; then
-    rm -f /etc/zincati/config.d/90-disable-auto-updates.toml
-    need_restart='true'
-fi
-
-# Early `next` releases before [1] had auto-updates disabled too. Let's
-# drop that config if it exists.
-# [1] https://github.com/coreos/fedora-coreos-config/commit/99eab318998441760cca224544fc713651f7a16d
-if [ -f /etc/zincati/config.d/90-disable-on-non-production-stream.toml ]; then
-    rm -f /etc/zincati/config.d/90-disable-on-non-production-stream.toml
-    need_restart='true'
-fi
-
-get_booted_deployment_json() {
-    rpm-ostree status  --json | jq -r '.deployments[] | select(.booted == true)'
-}
-version=$(get_booted_deployment_json | jq -r '.version')
-stream=$(get_booted_deployment_json | jq -r '.["base-commit-meta"]["fedora-coreos.stream"]')
-
-# Pick up the last release for the current stream from the update server
-test -f /srv/updateinfo.json || \
-    curl -L "https://updates.coreos.fedoraproject.org/v1/graph?basearch=$(arch)&stream=${stream}&rollout_wariness=0" > /srv/updateinfo.json
-last_release=$(jq -r .nodes[-1].version /srv/updateinfo.json)
-last_release_index=$(jq '.nodes | length-1' /srv/updateinfo.json)
-latest_edge=$(jq -r .edges[0][1] /srv/updateinfo.json)
-
-# Now that we have the release from update json, let's check if it has an edge pointing to it
-# The latest_edge would ideally have the value of last_release_index if the release has rolled out
-# If the edge does not exist, we would pick the second last release as our last_release
-if [ $last_release_index != $latest_edge ]; then
-    last_release=$(jq -r .nodes[-2].version /srv/updateinfo.json)
-fi
-
-# If the user dropped down a /etc/target_stream file then we'll
-# pick up the info from there.
-target_stream=$stream
-test -f /etc/target_stream && target_stream=$(< /etc/target_stream)
-test -f /srv/builds.json || \
-    curl -L "https://builds.coreos.fedoraproject.org/prod/streams/${target_stream}/builds/builds.json" > /srv/builds.json
-target_version=$(jq -r .builds[0].id /srv/builds.json)
-
-
 grab-gpg-keys() {
     # For older FCOS we had an issue where when we tried to pull the
     # commits from the repo it would fail if we were on N-2 because
@@ -111,8 +109,8 @@ grab-gpg-keys() {
         if [ ! -e $file ]; then
             need_restart='true'
             curl -L "https://src.fedoraproject.org/rpms/fedora-repos/raw/rawhide/f/RPM-GPG-KEY-fedora-${ver}-primary" | \
-                sudo tee $file
-            sudo chcon -v --reference="/etc/pki/rpm-gpg/RPM-GPG-KEY-fedora-${VERSION_ID}-primary" $file
+                tee $file
+            chcon -v --reference="/etc/pki/rpm-gpg/RPM-GPG-KEY-fedora-${VERSION_ID}-primary" $file
         fi
     done
 }
@@ -154,43 +152,16 @@ move-to-cgroups-v2() {
     fi
 }
 
-# A helper to wait for the fix-selinux-labels script to finish
-wait-for-coreos-fix-selinux-labels() {
-    # First make sure the migrations/fix script has finished (if it is going
-    # to run) before doing the checks
-    systemd-run --wait --property=After=coreos-fix-selinux-labels.service \
-        echo "Waited for coreos-fix-selinux-labels.service to finish"
-}
-
-# We need to drop the rollback deployment. During upgrade
-# `...-> 40.20240906.1.0 (A)-> 41.20241109.1.0 (B)-> 42.20241114.91.0 (C)`
-# 1) A->B, A has the unfixed ostree, the upgrade will copy dtb files
-# to `/boot/ostree` both for current A and new B with wrong label
-# 2) B->C, B has the fixed ostree, the upgrade will prune A, leave B
-# with wrong label, and new C with correct label
-# 3) Finaly booting C and will check that B has the wrong label
-# In this case we need to drop the rollback before checking.
-#
-# If then upgrade to newer D, the upgrade will prune B (wrong label),
-# leave C with correct label, and new D with correct label. (We
-# should remove the drop under this case)
-#
-# https://github.com/coreos/fedora-coreos-tracker/issues/1808
-#
-# NOTE: we can drop this once moved to F43.
-drop_rollback_on_aarch64() {
-    # The dtb copy issue was only ever an issue ever on aarch64
-    [ "$(arch)" != 'aarch64' ] && return
-    echo "Dropping rollback deployment because it could have mislabeled dtb files"
-    rpm-ostree cleanup -r
-}
-
 selinux-sanity-check() {
-    # First make sure the migrations/fix script has finished if this is the boot
-    # where the fixes are taking place.
-    wait-for-coreos-fix-selinux-labels
-    # Drop the rooback on aarch64 before checking.
-    drop_rollback_on_aarch64
+    # Drop the rollback deployment. In the case where the name of a
+    # label gets changed then the rollback deployment will show files
+    # as unlabeled_t because the currently loaded policy (i.e. the upgraded
+    # policy) doesn't know about the old label. Since we are more concerned
+    # about the upgraded system let's just focus on finding unlabeled files
+    # there and drop the rollback deployment.
+    # https://github.com/coreos/fedora-coreos-tracker/issues/2007#issuecomment-3197248482
+    echo "Dropping rollback deployment"
+    rpm-ostree cleanup --rollback
     # Verify SELinux labels are sane. Migration scripts should have cleaned
     # up https://github.com/coreos/fedora-coreos-tracker/issues/1772
     unlabeled="$(find /sysroot -context '*unlabeled_t*' -print0 | xargs --null -I{} ls -ldZ '{}')"
@@ -214,6 +185,12 @@ selinux-sanity-check() {
         #       - 38.20230322.1.0->42.20241023.91.0
         #       - https://github.com/fedora-selinux/selinux-policy/commit/b08568ca696f14d3232adef6a291ebb0ec80ba46
         #       - https://github.com/coreos/fedora-coreos-tracker/issues/1819
+        # - Would relabel /var/lib/systemd/random-seed from system_u:object_r:init_var_lib_t:s0 to system_u:object_r:random_seed_t:s0
+        #       - 42.20250526.1.0 -> 42.20250609.1.0
+        #       - https://github.com/coreos/fedora-coreos-tracker/issues/1965#issuecomment-2959831808
+        # - Would relabel /var/opt/kola* from unconfined_u:object_r:var_t:s0 to unconfined_u:object_r:usr_t:s0
+        #       - 42.20250410.2.0 -> 43.20251031.20.0
+        #       - https://github.com/coreos/fedora-coreos-tracker/issues/2052#issuecomment-3474594545
         declare -A exceptions=(
            ['/var/lib/cni']=1
            ['/etc/selinux/targeted/semanage.read.LOCK']=1
@@ -224,13 +201,18 @@ selinux-sanity-check() {
            ['/var/lib/systemd/home']=1
            ['/var/cache/systemd']=1
            ['/var/cache/systemd/home']=1
+           ['/var/lib/systemd/random-seed']=1
+           ['/var/opt/kola']=1
+           ['/var/opt/kola/extdata']=1
+           ['/var/opt/kola/extdata/commonlib.sh']=1
         )
         paths="$(echo "${mislabeled}" | grep "Would relabel" | cut -d ' ' -f 3)"
         found=""
         while read -r path; do
-            # Add in a few temporary glob exceptions
-            # https://github.com/coreos/fedora-coreos-tracker/issues/1806
-            [[ "${path}" =~ /etc/selinux/targeted/active/ ]] && continue
+            # Add in a glob exception for /var/srv since that's where our OSTree repo is
+            if [[ "${path}" =~ /var/srv ]]; then
+                 continue
+            fi
             if [[ "${exceptions[$path]:-noexception}" == 'noexception' ]]; then
                 echo "Unexpected mislabeled file found: ${path}"
                 found="1"
@@ -243,21 +225,137 @@ selinux-sanity-check() {
     ok "Selinux sanity checks passed"
 }
 
-ok "Reached version: $version"
+need_restart='false'
+arch=$(arch)
+
+# If there is an ostree repo archive tarball, let's extract/use it.
+if [ -f "$KOLA_EXT_DATA/ostree-repo.tar" ]; then
+    tar -C /srv/ -xf "$KOLA_EXT_DATA/ostree-repo.tar"
+    rm -vf "$KOLA_EXT_DATA/ostree-repo.tar"
+
+    # Switch to pulling from local ostree repo
+    cat <<'EOF' > /etc/ostree/remotes.d/fedora.conf
+[remote "fedora"]
+url=file:///srv/
+gpg-verify=true
+gpgkeypath=/etc/pki/rpm-gpg/
+EOF
+
+    # make writable by all so below zincati ExecStartPre copy over it
+    chmod 666 /etc/ostree/remotes.d/fedora.conf
+
+    # The oci migration script had a check for the URL to make sure we only
+    # migrated the people who were using the defaults so we need to switch
+    # it back when the oci migration happens.
+    # https://github.com/coreos/fedora-coreos-config/blob/d4c815329d88dd9dbaf1902a2b60a08df4b41c1a/overlay.d/35oci-migration/usr/libexec/coreos-oci-rebase#L43
+    mkdir -p /etc/systemd/system/zincati.service.d
+    cat <<'EOF' > /etc/systemd/system/zincati.service.d/005-fixup-remote-url.conf
+[Service]
+ExecStartPre=/bin/bash -c \
+  "test -f /usr/lib/systemd/system/zincati.service.d/010-oci-migration.conf && \
+      cp -v /usr/etc/ostree/remotes.d/fedora.conf /etc/ostree/remotes.d/fedora.conf || true"
+EOF
+    need_restart='true'
+fi
+
+# delete the disabling of updates that was done by the test framework
+if [ -f /etc/zincati/config.d/90-disable-auto-updates.toml ]; then
+    rm -f /etc/zincati/config.d/90-disable-auto-updates.toml
+    need_restart='true'
+fi
+
+# Early `next` releases before [1] had auto-updates disabled too. Let's
+# drop that config if it exists.
+# [1] https://github.com/coreos/fedora-coreos-config/commit/99eab318998441760cca224544fc713651f7a16d
+if [ -f /etc/zincati/config.d/90-disable-on-non-production-stream.toml ]; then
+    rm -f /etc/zincati/config.d/90-disable-on-non-production-stream.toml
+    need_restart='true'
+fi
+
+# Avoid xtrace expanding JSON variables into large, noisy log entries.
+set +x
+booted_deployment_json=$(rpm-ostree status  --json | \
+                         jq -r '.deployments[] | select(.booted == true)')
+version=$(jq -r '.version' <<< "${booted_deployment_json}")
+ok "Reached version: ${version}"
+
+# The stream info can come from one of 3 places depending on how old
+# the build is.
+#
+# 1. <=41 the stream was just directly attached to base-commit-meta
+stream=$(jq -r '.["base-commit-meta"]["fedora-coreos.stream"]' <<< "${booted_deployment_json}")
+if [ "${stream}" == "null" ]; then
+    # 2. In 42 we switched to shipping updates as containers and the stream moved to
+    # an annotation in the ostree manifest.
+    ostree_manifest=$(jq -r '.["base-commit-meta"]["ostree.manifest"]' <<< "${booted_deployment_json}")
+    if [ "${ostree_manifest}" != "null" ]; then
+        stream=$(jq -r '.annotations | .["fedora-coreos.stream"]' <<< "${ostree_manifest}")
+    fi
+fi
+if [ "${stream}" == "null" ]; then
+    # 3. In 43+ we moved to building the OS via container tools and we
+    # moved to the com.coreos.stream label.
+    container_image_config=$(jq -r '.["base-commit-meta"]["ostree.container.image-config"]' <<< "${booted_deployment_json}")
+    if [ "${container_image_config}" != "null" ]; then
+        stream=$(jq -r '.config.Labels["com.coreos.stream"]' <<< "${container_image_config}")
+    fi
+fi
+if [ -z "${stream}" ] || [ "${stream}" == "null" ]; then
+    fatal "Stream was not detected from booted deployment"
+fi
+ok "Reached stream: ${stream}"
+
+# If the user dropped down a /etc/target_stream file then we'll
+# pick up the info from there.
+target_stream=$stream
+test -f /etc/target_stream && target_stream=$(< /etc/target_stream)
+test -f /srv/builds.json || \
+    curl -L "https://builds.coreos.fedoraproject.org/prod/streams/${target_stream}/builds/builds.json" > /srv/builds.json
+target_version=$(jq -r .builds[0].id /srv/builds.json)
+ok "Target version: ${target_version}"
+ok "Target stream: ${target_stream}"
 
 # Are we all the way at the desired target version?
 # If so then we can exit with success!
 if vereq $version $target_version; then
     ok "Fully upgraded to $target_version"
-    # log bootupctl information for inspection and check the status output
-    state=$(/usr/bin/bootupctl status 2>&1)
-    echo "$state"
-    if ! echo "$state" | grep -q "CoreOS aleph version"; then
-        fatal "check bootupctl status output"
+    # Verify bootupctl status includes aleph-version.
+    state=$(/usr/bin/bootupctl status --json 2>&1)
+    if ! echo "$state" | jq -e '."aleph-version"' > /dev/null; then
+        fatal "check bootupctl status --json output - should include 'aleph-version'"
     fi
     # One last check!
     selinux-sanity-check
     exit 0
+fi
+set -x
+
+# Pick up the last release for the current stream from the update server
+test -f /srv/updateinfo.json || \
+    curl -L "https://updates.coreos.fedoraproject.org/v1/graph?basearch=${arch}&stream=${stream}&rollout_wariness=0&oci=true" > /srv/updateinfo.json
+# Extract all destination indexes and select the newest one.
+#
+# Edges contain [source, destination] node indexes.
+# [.edges[][1]] | max // empty means:
+#   [.edges[][1]]
+#   - Iterate over every edge in .edges.
+#   - Extract element 1, the edge’s destination node index.
+#   - Collect those indexes into an array.
+#   max
+#   - Select the largest destination index.
+#   - If there are no edges, the result is null.
+#   // empty
+#   - If the result is null, emit no output.
+#   - In Bash, command substitution then produces an empty string.
+last_release_index=$(jq -r '[.edges[][1]] | max // empty' /srv/updateinfo.json)
+if [ -z "${last_release_index}" ]; then
+    fatal "Update graph contains no usable edges"
+fi
+# Grab the actual version string from the index.
+last_release=$(jq -r --argjson index "${last_release_index}" \
+    '.nodes[$index].version' /srv/updateinfo.json)
+if [ -z "${last_release}" ] || [ "${last_release}" == "null" ]; then
+    fatal "Update graph edge points to a missing node"
 fi
 
 # Apply workarounds based on the current version of the system.
@@ -299,16 +397,49 @@ case "$stream" in
     *) fatal "unexpected stream: $stream";;
 esac
 
+# First, since coreos-fix-selinux-labels.service runs before zincati.service
+# let's wait until that service is finished before proceeding (and potentially
+# timing out below as a result of not waiting here). Note that if we are
+# running on an older release that doesn't have coreos-fix-selinux-labels.service
+# this is essentially a no-op.
+systemd-run --wait --property=After=coreos-fix-selinux-labels.service \
+    echo "Waited for coreos-fix-selinux-labels.service to finish"
+
 # If we have made it all the way to the last release then
 # we have one more test. We'll now rebase to the target
 # version, which should be in the compose OSTree repo.
 if vereq $version $last_release; then
+    # Since we'll be manually running `rpm-ostree` let's stop zincati
     systemctl stop zincati
-    # In case the SELinux fix script is running this boot let's wait for it to
-    # finish before initiating an `rpm-ostree rebase` so we aren't writing at the
-    # same time it's fixing.
-    wait-for-coreos-fix-selinux-labels
-    rpm-ostree rebase "fedora-compose:fedora/$(arch)/coreos/${target_stream}" $target_version
+
+    # Avoid xtrace expanding the image-inspection JSON into a large log entry.
+    set +x
+    inspect=$(skopeo inspect --retry-times=3 -n docker://quay.io/fedora/fedora-coreos:${target_stream})
+    registry_version=$(jq -r '.Labels."org.opencontainers.image.version"' <<< "${inspect}")
+    set -x
+    if [ "${registry_version}" == "${target_version}" ]; then
+        # If the container is already pushed to the registry we'll use the registry
+        if [ "${stream}" == "${target_stream}" ]; then
+            # If we aren't switching steams we can just upgrade
+            rpm-ostree upgrade
+        else
+            # else we need to rebase
+            rpm-ostree rebase "ostree-image-signed:docker://quay.io/fedora/fedora-coreos:${target_stream}"
+        fi
+    else
+        # Since in the next steps we are making multiple copies of the update on the
+        # system (i.e. update.ociarchive and copying into OSTree storage) let's free
+        # up some space by dropping the rollback deployment.
+        rpm-ostree cleanup --rollback
+        # Pull the ociarchive from the builds dir here because the
+        # containers aren't pushed to quay yet. This can happen in the
+        # case where the release job isn't autotriggered (i.e. prod builds)
+        # or if somehow the release job failed.
+        curl -L -o /srv/update.ociarchive \
+            "https://builds.coreos.fedoraproject.org/prod/streams/${target_stream}/builds/${target_version}/${arch}/fedora-coreos-${target_version}-ostree.${arch}.ociarchive"
+        rpm-ostree rebase "ostree-unverified-image:oci-archive:/srv/update.ociarchive"
+        rm /srv/update.ociarchive
+    fi
     /tmp/autopkgtest-reboot $version # execute the reboot
     sleep infinity
 fi
@@ -318,6 +449,9 @@ if [ "${need_restart}" == "true" ]; then
     /tmp/autopkgtest-reboot setup
     sleep infinity
 fi
+
+# We're ready for the update to happen. Start zincati.
+systemctl start zincati
 
 # Watch the Zincati logs to see if it got a lead on a new update.
 # Timeout after some time if no update. Unset pipefail since the
@@ -330,11 +464,49 @@ if ! timeout 90s $cmd | grep --max-count=1 'proceeding to stage it'; then
 fi
 set -o pipefail
 
+# OK update has been initiated. Let's fork off a process that will wait until
+# the deployment is written before signaling the impending reboot. Waiting
+# before signaling reboot will mean we get less timeouts in the code that
+# waits for the reboot to happen.
+#
+# The strategy of using systemd-run for this was lifted from
+# https://github.com/coreos/coreos-assembler/commit/242a88eae7e167efa9e04dcef9b751c6df137333
+#
+# On <35 SELinux won't allow a path unit to monitor /ostree/deploy, so disable
+verlt $version '35.00000000.0.0' && setenforce 0
+systemd-run -u refchanged                      \
+    --path-property=PathChanged=/ostree/deploy \
+    bash /tmp/autopkgtest-reboot-prepare $version
 
-# OK update has been initiated, prepare for reboot and loop to show
-# status of zincati and rpm-ostreed
-/tmp/autopkgtest-reboot-prepare $version
+# While we wait, loop to show status of zincati and rpm-ostreed
 while true; do
-    sleep 20
-    systemctl status rpm-ostreed zincati --lines=0
+    sleep 30
+    # Ignore error here. Older systemd (~F32) errors here if one of
+    # the services isn't active.
+    systemctl status rpm-ostreed zincati --lines=0 || true
+
+    # Determine if we've stalled and need to best-effort retry
+    need_reset='false'
+
+    # If the upgrade stalls out (remote infra flaking?) for 5 minutes -> reset
+    line="$(journalctl -b0 --since='5 minutes ago' -u rpm-ostreed -n 1)"
+    if [ "${line}"  == '-- No entries --' ]; then
+        echo "rpm-ostree has stalled for 5 minutes; restarting zincati"
+        need_reset='true'
+    fi
+
+    # If we've hit the finish_pipe bug -> reset
+    # https://github.com/coreos/fedora-coreos-tracker/issues/2149
+    line="$(journalctl --until='30 seconds ago' -u rpm-ostreed -n 1)"
+    if [[ "${line}"  =~ 'DEBUG finish_pipe: closing pipe' ]]; then
+        echo "rpm-ostree has stalled on finish_pipe bug; restarting zincati"
+        need_reset='true'
+    fi
+
+    if [ "${need_reset}" == "true" ]; then
+        systemctl stop zincati
+        rpm-ostree cancel
+        systemctl stop rpm-ostreed
+        systemctl start zincati
+    fi
 done
